@@ -1,0 +1,42 @@
+name: Build Linux Artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+
+      - name: Build relinker
+        run: cmake --build build --parallel
+
+      - name: Build system libs (prx)
+        run: cmake --build build --target libs --parallel
+
+      - name: Stage artifacts
+        run: |
+          set -eux
+          mkdir -p /tmp/art/libs
+          cp build/core/relinker/relinker /tmp/art/relinker
+          cp build/core/libs/libs/*.prx /tmp/art/libs/
+          ls -la /tmp/art
+          ls /tmp/art/libs | wc -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anyps5-linux
+          path: /tmp/art
+          if-no-files-found: error
