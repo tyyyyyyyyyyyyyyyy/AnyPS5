@@ -201,6 +201,17 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
         const auto types = requirements.memoryTypeBits & pointer.memoryTypeBits;
+        if (tryAll && v == 0) {
+            const long psz = sysconf(_SC_PAGESIZE);
+            std::size_t resident = 0, pages = 0;
+            if (psz > 0) {
+                pages = static_cast<std::size_t>((bytes + static_cast<std::uint64_t>(psz) - 1) / static_cast<std::uint64_t>(psz));
+                std::vector<unsigned char> vec(pages);
+                if (mincore(host, static_cast<std::size_t>(bytes), vec.data()) == 0) { for (unsigned char b : vec) if ((b & 1u) != 0) ++resident; }
+                else { resident = static_cast<std::size_t>(-1); }
+            }
+            std::fprintf(stderr, "[gpu] host import diag 0x%llx+0x%llx types=0x%x resident=%zu/%zu\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(bytes), static_cast<unsigned>(types), resident, pages);
+        }
         if (types == 0) { context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr); lastStep = "memory type selection"; lastResult = VK_ERROR_FORMAT_NOT_SUPPORTED; continue; }
         std::uint32_t indices[32];
         std::size_t indexCount = 0;
@@ -209,6 +220,8 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
         } else {
             indices[indexCount++] = static_cast<std::uint32_t>(std::countr_zero(types));
         }
+        char results[600];
+        std::size_t rn = 0;
         for (std::size_t t = 0; t < indexCount; ++t) {
             VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
@@ -216,22 +229,26 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
             allocation.allocationSize = bytes;
             allocation.memoryTypeIndex = indices[t];
             VkDeviceMemory memory = VK_NULL_HANDLE;
-            const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
-            if (result != VK_SUCCESS) { lastStep = "vkAllocateMemory"; lastResult = result; continue; }
-            if (context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0) != VK_SUCCESS) { context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); lastStep = "vkBindBufferMemory"; lastResult = VK_ERROR_UNKNOWN; continue; }
-            VkDeviceAddress address = 0;
-            if (variant.bda) {
+            VkResult result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+            if (result == VK_SUCCESS) result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0);
+            if (result == VK_SUCCESS && variant.bda) {
                 const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
-                address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
-                if (address == 0) { context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); lastStep = "vkGetBufferDeviceAddressKHR"; lastResult = VK_ERROR_UNKNOWN; continue; }
+                entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+                if (entry.address == 0) result = VK_ERROR_UNKNOWN;
             }
-            entry.buffer = buffer;
-            entry.memory = memory;
-            entry.address = address;
-            static bool reported = false;
-            if (tryAll && !reported) { reported = true; std::fprintf(stderr, "[gpu] host import variant accepted: bda=%d allTypes=%d memoryType=%u\n", variant.bda ? 1 : 0, variant.allTypes ? 1 : 0, indices[t]); }
-            return nullptr;
+            if (result == VK_SUCCESS) {
+                entry.buffer = buffer;
+                entry.memory = memory;
+                static bool reported = false;
+                if (tryAll && !reported) { reported = true; std::fprintf(stderr, "[gpu] host import variant accepted: bda=%d allTypes=%d memoryType=%u\n", variant.bda ? 1 : 0, variant.allTypes ? 1 : 0, indices[t]); }
+                return nullptr;
+            }
+            if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+            lastStep = "vkAllocateMemory";
+            lastResult = result;
+            if (tryAll && rn + 24 < sizeof(results)) rn += static_cast<std::size_t>(std::snprintf(results + rn, sizeof(results) - rn, " t%u=%d", indices[t], static_cast<int>(result)));
         }
+        if (tryAll) std::fprintf(stderr, "[gpu] host import diag 0x%llx+0x%llx variant bda=%d all=%d:%s\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(bytes), variant.bda ? 1 : 0, variant.allTypes ? 1 : 0, results);
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
     }
     failure = lastResult;
