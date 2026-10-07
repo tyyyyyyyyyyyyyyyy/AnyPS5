@@ -15,6 +15,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install X11 + audio dev deps for SDL2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxinerama-dev libxss-dev libxfixes-dev libxrender-dev \
+            libxkbcommon-dev libxtst-dev libudev-dev libasound2-dev libpulse-dev
+
       - name: Configure
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
