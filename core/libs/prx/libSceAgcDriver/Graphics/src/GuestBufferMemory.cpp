@@ -186,6 +186,23 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     static const bool tryAll = std::getenv("APS5_HOST_IMPORT_TRYALL") != nullptr;
     const Variant variants[4] = {{true, false}, {true, true}, {false, true}, {false, false}};
     const std::size_t variantCount = tryAll ? 4u : 1u;
+#ifdef __linux__
+    // Diagnosis 2026-10-07 (RX 5700 / RADV): the large direct-memory ranges are sparse memfd
+    // (MAP_SHARED) mappings whose pages are not committed yet (mincore: 0/8160); RADV's host-pointer
+    // import (amdgpu userptr) then fails vkAllocateMemory with VK_ERROR_UNKNOWN. Commit the pages
+    // first. POPULATE_WRITE for writable mappings, POPULATE_READ (read-only) as a fallback.
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    if (tryAll || std::getenv("ANYPS5_IMPORT_POPULATE") != nullptr) {
+        if (madvise(host, static_cast<std::size_t>(bytes), MADV_POPULATE_WRITE) != 0) {
+            madvise(host, static_cast<std::size_t>(bytes), MADV_POPULATE_READ);
+        }
+    }
+#endif
 
     VkResult lastResult = VK_ERROR_UNKNOWN;
     const char* lastStep = "vkAllocateMemory";
