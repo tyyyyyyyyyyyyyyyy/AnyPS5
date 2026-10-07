@@ -173,38 +173,69 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
     const auto bytes = entry.bytes;
     void* const host = entry.alias != nullptr ? entry.alias : reinterpret_cast<void*>(entry.base);
-    const auto failed = [&](const char* step, VkResult result) -> const char* {
-        if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
-        entry.buffer = VK_NULL_HANDLE;
-        entry.memory = VK_NULL_HANDLE;
-        failure = result;
-        return step;
-    };
     const VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-    info.size = bytes;
     // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
+    const VkBufferUsageFlags baseUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-    if (const auto result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer); result != VK_SUCCESS) return failed("vkGetMemoryHostPointerPropertiesEXT", result);
-    VkMemoryRequirements requirements{};
-    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, entry.buffer, &requirements);
-    const auto types = requirements.memoryTypeBits & pointer.memoryTypeBits;
-    if (types == 0) return failed("memory type selection", VK_ERROR_FORMAT_NOT_SUPPORTED);
-    const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
-    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-    allocation.allocationSize = bytes;
-    allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
-    if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
-    if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
-    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
-    entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
-    if (entry.address == 0) return failed("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
-    return nullptr;
+    if (const auto result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer); result != VK_SUCCESS) { failure = result; return "vkGetMemoryHostPointerPropertiesEXT"; }
+
+    struct Variant { bool bda; bool allTypes; };
+    // Default: the original single attempt (lowest memory type, device-address flag on). With
+    // APS5_HOST_IMPORT_TRYALL (RADV/Linux diagnosis) the alternate forms a driver may accept are
+    // tried: every memory type in the intersection, and without the shader-device-address flag.
+    static const bool tryAll = std::getenv("APS5_HOST_IMPORT_TRYALL") != nullptr;
+    const Variant variants[4] = {{true, false}, {true, true}, {false, true}, {false, false}};
+    const std::size_t variantCount = tryAll ? 4u : 1u;
+
+    VkResult lastResult = VK_ERROR_UNKNOWN;
+    const char* lastStep = "vkAllocateMemory";
+
+    for (std::size_t v = 0; v < variantCount; ++v) {
+        const Variant variant = variants[v];
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        info.size = bytes;
+        info.usage = baseUsage | (variant.bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer) != VK_SUCCESS) { lastStep = "vkCreateBuffer"; lastResult = VK_ERROR_UNKNOWN; continue; }
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+        const auto types = requirements.memoryTypeBits & pointer.memoryTypeBits;
+        if (types == 0) { context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr); lastStep = "memory type selection"; lastResult = VK_ERROR_FORMAT_NOT_SUPPORTED; continue; }
+        std::uint32_t indices[32];
+        std::size_t indexCount = 0;
+        if (variant.allTypes) {
+            for (std::uint32_t i = 0; i < 32; ++i) if ((types & (1u << i)) != 0) indices[indexCount++] = i;
+        } else {
+            indices[indexCount++] = static_cast<std::uint32_t>(std::countr_zero(types));
+        }
+        for (std::size_t t = 0; t < indexCount; ++t) {
+            VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, variant.bda ? static_cast<const void*>(&flags) : static_cast<const void*>(&import)};
+            allocation.allocationSize = bytes;
+            allocation.memoryTypeIndex = indices[t];
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+            if (result != VK_SUCCESS) { lastStep = "vkAllocateMemory"; lastResult = result; continue; }
+            if (context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0) != VK_SUCCESS) { context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); lastStep = "vkBindBufferMemory"; lastResult = VK_ERROR_UNKNOWN; continue; }
+            VkDeviceAddress address = 0;
+            if (variant.bda) {
+                const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+                address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+                if (address == 0) { context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); lastStep = "vkGetBufferDeviceAddressKHR"; lastResult = VK_ERROR_UNKNOWN; continue; }
+            }
+            entry.buffer = buffer;
+            entry.memory = memory;
+            entry.address = address;
+            static bool reported = false;
+            if (tryAll && !reported) { reported = true; std::fprintf(stderr, "[gpu] host import variant accepted: bda=%d allTypes=%d memoryType=%u\n", variant.bda ? 1 : 0, variant.allTypes ? 1 : 0, indices[t]); }
+            return nullptr;
+        }
+        context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+    }
+    failure = lastResult;
+    return lastStep;
 }
 
 #ifndef _WIN32
